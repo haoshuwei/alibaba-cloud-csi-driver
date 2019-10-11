@@ -1,0 +1,19 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: alicloud-nas
+mountOptions:
+- nolock,tcp,noresvport
+- vers=3
+parameters:
+  volumeAs: filesystem
+  protocalType: NFS
+  storageType: Performance
+  zoneId: "cn-hangzhou-f"
+  description: "Auto created by csi plugin"
+  networkType: "vpc"
+  vpcId: ""
+  vSwitchId: ""
+  accessGroupName: "DEFAULT_VPC_GROUP_NAME"
+provisioner: nasplugin.csi.alibabacloud.com
+reclaimPolicy: Delete

@@ -22,7 +22,29 @@ import (
 	"strings"
 
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
+	"io/ioutil"
+	"net/http"
+	aliNas "github.com/aliyun/alibaba-cloud-sdk-go/services/nas"
+	"path/filepath"
+	"time"
+	log "github.com/Sirupsen/logrus"
+	"encoding/json"
 )
+
+const (
+	METADATA_URL                    = "http://100.100.100.200/latest/meta-data/"
+	REGION_TAG                      = "region-id"
+)
+
+// Define STS Token Response
+type RoleAuth struct {
+	AccessKeyId     string
+	AccessKeySecret string
+	Expiration      time.Time
+	SecurityToken   string
+	LastUpdated     time.Time
+	Code            string
+}
 
 //DoMount execute the mount command for nas dir
 func DoMount(nfsServer, nfsPath, nfsVers, mountOptions, mountPoint, volumeId string) error {
@@ -105,4 +127,95 @@ func GetNfsDetails(nfsServersString string) (string, string) {
 		nfsPath = ""
 	}
 	return nfsServer, nfsPath
+}
+
+// GetMetaData get host regionid, zoneid
+func GetMetaData(resource string) string {
+	resp, err := http.Get(METADATA_URL + resource)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+	return string(body)
+}
+
+func updateNasClient(client *aliNas.Client) *aliNas.Client {
+	accessKeyID, accessSecret, accessToken := GetDefaultAK()
+	if accessToken != "" {
+		client = newNasClient(accessKeyID, accessSecret, accessToken)
+	}
+	//if client.Client.GetConfig() != nil {
+	//	client.Client.GetConfig().UserAgent = KUBERNETES_ALICLOUD_IDENTITY
+	//}
+	return client
+}
+
+// GetDefaultAK read default ak from local file or from STS
+func GetDefaultAK() (string, string, string) {
+	accessKeyID, accessSecret := GetLocalAK()
+
+	accessToken := ""
+	if accessKeyID == "" || accessSecret == "" {
+		accessKeyID, accessSecret, accessToken = GetSTSAK()
+	}
+
+	return accessKeyID, accessSecret, accessToken
+}
+
+// GetLocalAK return if ak meta defined in env
+func GetLocalAK() (string, string) {
+	var accessKeyID, accessSecret string
+	// first check if the environment setting
+	accessKeyID = os.Getenv("ACCESS_KEY_ID")
+	accessSecret = os.Getenv("ACCESS_KEY_SECRET")
+	if accessKeyID != "" && accessSecret != "" {
+		return accessKeyID, accessSecret
+	}
+
+	return accessKeyID, accessSecret
+}
+
+// GetSTSAK get STS AK and token from ecs meta server
+func GetSTSAK() (string, string, string) {
+	roleAuth := RoleAuth{}
+	subpath := "ram/security-credentials/"
+	roleName, err := utils.GetMetaData(subpath)
+	if err != nil {
+		log.Errorf("GetSTSToken: request roleName with error: %s", err.Error())
+		return "", "", ""
+	}
+
+	fullPath := filepath.Join(subpath, roleName)
+	roleInfo, err := utils.GetMetaData(fullPath)
+	if err != nil {
+		log.Errorf("GetSTSToken: request roleInfo with error: %s", err.Error())
+		return "", "", ""
+	}
+
+	err = json.Unmarshal([]byte(roleInfo), &roleAuth)
+	if err != nil {
+		log.Errorf("GetSTSToken: unmarshal roleInfo: %s, with error: %s", roleInfo, err.Error())
+		return "", "", ""
+	}
+	return roleAuth.AccessKeyId, roleAuth.AccessKeySecret, roleAuth.SecurityToken
+}
+
+func newNasClient(accessKeyId, accessKeySecret, accessToken string) (nasClient *aliNas.Client) {
+	var err error
+	if accessToken == "" {
+		nasClient, err = aliNas.NewClientWithAccessKey(GetMetaData(REGION_TAG), accessKeyId, accessKeySecret)
+		if err != nil {
+			return nil
+		}
+	} else {
+		nasClient, err = aliNas.NewClientWithStsToken(GetMetaData(REGION_TAG), accessKeyId, accessKeySecret, accessToken)
+		if err != nil {
+			return nil
+		}
+	}
+	return
 }
