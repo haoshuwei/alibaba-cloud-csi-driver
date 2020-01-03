@@ -32,9 +32,12 @@ import (
 	"github.com/kubernetes-csi/drivers/pkg/csi-common"
 	"github.com/kubernetes-sigs/alibaba-cloud-csi-driver/pkg/utils"
 	log "github.com/sirupsen/logrus"
+	k8smount "k8s.io/kubernetes/pkg/util/mount"
 )
 
 type nodeServer struct {
+	mounter           utils.Mounter
+	k8smounter        k8smount.Interface
 	*csicommon.DefaultNodeServer
 }
 
@@ -46,6 +49,7 @@ type Options struct {
 	AkID      string `json:"akId"`
 	AkSecret  string `json:"akSecret"`
 	Path      string `json:"path"`
+	UseSharedPath string `json:"useSharedPath"`
 }
 
 const (
@@ -59,6 +63,11 @@ const (
 	AkID = "akId"
 	// AkSecret is Ak Secret
 	AkSecret = "akSecret"
+	// BaseSharedPath is Base Shared Path
+	//BaseSharedPath = "/var/lib/kubelet/plugins/ossplugin.csi.alibabacloud.com/shared/"
+	BaseSharedPath = "/var/lib/kubelet/plugins/kubernetes.io/csi/shared/"
+	// SharedPathKeyStr is used to check if mountpoint is shared or not
+	SharedPathKeyStr = ""
 )
 
 func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
@@ -79,11 +88,15 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			opt.AkSecret = strings.TrimSpace(value)
 		} else if key == "path" {
 			opt.Path = strings.TrimSpace(value)
+		} else if key == "usesharedpath" {
+			opt.UseSharedPath = strings.TrimSpace(value)
 		}
 	}
+
 	if opt.Path == "" {
 		opt.Path = "/"
 	}
+
 
 	// support set ak by secret
 	if opt.AkID == "" || opt.AkSecret == "" {
@@ -108,6 +121,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	argStr := "Bucket: " + opt.Bucket + ", url: " + opt.URL + ", OtherOpts: " + opt.OtherOpts + ", Path: " + opt.Path
 	log.Infof("NodePublishVolume:: Starting Oss Mount: %s", argStr)
 
+
 	if utils.IsMounted(mountPath) {
 		log.Infof("NodePublishVolume: The mountpoint is mounted: %s", mountPath)
 		return &csi.NodePublishVolumeResponse{}, nil
@@ -126,11 +140,51 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	}
 
 	// default use allow_other
-	mntCmd := fmt.Sprintf("systemd-run --scope -- /usr/local/bin/ossfs %s:%s %s -ourl=%s %s", opt.Bucket, opt.Path, mountPath, opt.URL, opt.OtherOpts)
-	if out, err := connectorRun(mntCmd); err != nil {
-		if err != nil {
-			log.Errorf("Ossfs mount error: %s", err.Error())
-			return nil, errors.New("Create OSS volume fail: " + err.Error() + ", out: " + out)
+	var mntCmd string
+	if strings.ToLower(opt.UseSharedPath) == "true" {
+		log.Infof("===========SharedPath start %s", req.GetVolumeId())
+		sharedPath := BaseSharedPath + req.GetVolumeId()
+		if err := utils.CreateDest(sharedPath); err != nil {
+			log.Error("Ossfs mount error: %s", err.Error())
+			return nil, errors.New("Create OSS volume fail: " + err.Error() )
+		}
+		if IsOssfsMounted(sharedPath) && IsOssfsAvailable(sharedPath) {
+		//if IsOssfsMounted(sharedPath) {
+			log.Infof("===========SharedPath is mounted and available, skip")
+			log.Infof("NodePublishVolume: The shared path: %s is mounted and available, skip this step", sharedPath)
+		} else  {
+			//if !IsOssfsAvailable(sharedPath) {
+			//	log.Infof("===========SharedPath is mounted and not available, umount %s", sharedPath)
+			//	var mutex sync.Mutex
+			//	mutex.Lock()
+			//	umntCmd := fmt.Sprintf("umount -f %s", sharedPath)
+			//	if _, err := utils.Run(umntCmd); err != nil {
+			//		log.Errorf("Umount oss fail, with: %s", err.Error())
+			//		return nil, errors.New("Oss, Umount oss Fail: " + err.Error())
+			//	}
+			//	defer mutex.Unlock()
+			//}
+			mntCmd = fmt.Sprintf("systemd-run --scope -- /usr/local/bin/ossfs %s:%s %s -ourl=%s %s", opt.Bucket, opt.Path, sharedPath, opt.URL, opt.OtherOpts)
+			if out, err := connectorRun(mntCmd); err != nil {
+				if err != nil {
+					log.Errorf("Ossfs mount error: %s", err.Error())
+					return nil, errors.New("Create OSS volume fail: " + err.Error() + ", out: " + out)
+				}
+			}
+		}
+		log.Infof("NodePublishVolume:: Start mount operation from source [%s] to dest [%s]", sharedPath, mountPath)
+		options := []string{"bind"}
+		if err := ns.k8smounter.Mount(sharedPath, mountPath, "", options); err != nil {
+			log.Error("Ossfs mount error: %s", err.Error())
+			return nil, errors.New("Create OSS volume fail: " + err.Error() )
+		}
+	} else {
+		mntCmd = fmt.Sprintf("systemd-run --scope -- /usr/local/bin/ossfs %s:%s %s -ourl=%s %s", opt.Bucket, opt.Path, mountPath, opt.URL, opt.OtherOpts)
+		if out, err := connectorRun(mntCmd); err != nil {
+			if err != nil {
+				log.Errorf("Ossfs mount error: %s", err.Error())
+				return nil, errors.New("Create OSS volume fail: " + err.Error() + ", out: " + out)
+			}
 		}
 	}
 
@@ -245,11 +299,31 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 		return &csi.NodeUnpublishVolumeResponse{}, nil
 	}
 
-	umntCmd := fmt.Sprintf("umount -f %s", mountPoint)
+	pvName := req.GetVolumeId()
+	var umntCmd string
+	sharedMountPoint := fmt.Sprintf("/var/lib/kubelet/plugins/ossplugin.csi.alibabacloud.com/shared/%s", pvName)
+	if IsOssfsMounted(sharedMountPoint) {
+		log.Infof("NodeUnpublishVolume:: Starting umount a shared path oss volume: %s", req.TargetPath)
+		code, err := IsLastSharedVol(pvName)
+		if err != nil {
+			log.Errorf("Umount oss fail, with: %s", err.Error())
+			return nil, errors.New("Oss, Umount oss Fail: " + err.Error())
+		}
+		switch code {
+		case "1":
+			umntCmd = fmt.Sprintf("umount %s && umount -f %s%s", mountPoint, BaseSharedPath, pvName)
+		default:
+			umntCmd = fmt.Sprintf("umount %s", mountPoint)
+		}
+	} else {
+		umntCmd = fmt.Sprintf("umount -f %s", mountPoint)
+	}
 	if _, err := utils.Run(umntCmd); err != nil {
 		log.Errorf("Umount oss fail, with: %s", err.Error())
 		return nil, errors.New("Oss, Umount oss Fail: " + err.Error())
 	}
+
+
 
 	log.Infof("NodeUnpublishVolume:: Umount OSS Successful: %s", mountPoint)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
@@ -274,6 +348,45 @@ func IsHostMounted(mountPath string) bool {
 	cmd := fmt.Sprintf("%s mount | grep \"%s type\" | grep -v grep", NsenterCmd, mountPath)
 	out, err := utils.Run(cmd)
 	if err != nil || out == "" {
+		return false
+	}
+	return true
+}
+
+// IsOssfsMounted return if mountPath is mounted
+func IsOssfsMounted(mountPath string) bool {
+	checkMountCountCmd := fmt.Sprintf("%s mount | grep %s | grep %s | grep -v grep | wc -l", NsenterCmd, mountPath, OssFsType)
+	out, err := utils.Run(checkMountCountCmd)
+	log.Infof("====IsOssfsMounted %s", out)
+	if err != nil {
+		return false
+	}
+	if strings.TrimSpace(out) == "0" {
+		return false
+	}
+	return true
+}
+
+// IsOssfsMounted return if mountPath is mounted
+func IsLastSharedVol(pvName string) (string, error) {
+	keyStr := fmt.Sprintf("volumes/kubernetes.io~csi/%s/mount", pvName)
+	checkMountCountCmd := fmt.Sprintf("%s mount | grep %s | grep %s | grep -v grep | wc -l", NsenterCmd, keyStr, OssFsType)
+	out, err := utils.Run(checkMountCountCmd)
+	if err != nil {
+		return "0", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// IsOssfsAvailable return if mountPath is available
+func IsOssfsAvailable(mountPath string) bool {
+	log.Infof("====IsOssfsMounted:: start mountpoint checking")
+	checkMountCountCmd := fmt.Sprintf("%s mountpoint %s", NsenterCmd, mountPath)
+	exitCode, err := utils.RunWithExitCode(checkMountCountCmd)
+	if err != nil {
+		return false
+	}
+	if exitCode != "0" {
 		return false
 	}
 	return true

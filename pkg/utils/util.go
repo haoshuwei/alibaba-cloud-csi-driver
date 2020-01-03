@@ -29,6 +29,7 @@ import (
 	"reflect"
 	"strings"
 	"time"
+	"bytes"
 )
 
 //DefaultOptions used for global ak
@@ -109,6 +110,21 @@ func Run(cmd string) (string, error) {
 	return string(out), nil
 }
 
+// RunWithExitCode run shell command and return err exit code
+func RunWithExitCode(cmd string) (string, error) {
+	runCmd := exec.Command("sh", "-c", cmd)
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	runCmd.Stdout = &out
+	runCmd.Stderr = &stderr
+	err := runCmd.Run()
+	if err != nil {
+		return stderr.String(), err
+	}
+	return "0", nil
+
+}
+
 // CreateDest create de destination dir
 func CreateDest(dest string) error {
 	fi, err := os.Lstat(dest)
@@ -140,6 +156,7 @@ func IsMounted(mountPath string) bool {
 	}
 	return true
 }
+
 
 // Umount do an unmount operation
 func Umount(mountPath string) bool {

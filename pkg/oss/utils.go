@@ -26,6 +26,8 @@ const (
 	MetadataURL = "http://100.100.100.200/latest/meta-data/"
 	// InstanceID is instance ID
 	InstanceID = "instance-id"
+	// OssFsType is ossfs type
+	OssFsType = "fuse.ossfs"
 )
 
 // GetMetaData get host regionid, zoneid
@@ -41,3 +43,5 @@ func GetMetaData(resource string) string {
 	}
 	return string(body)
 }
+
+

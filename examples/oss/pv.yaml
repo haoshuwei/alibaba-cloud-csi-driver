@@ -21,3 +21,4 @@ spec:
       akId: "***"
       akSecret: "***"
       path: "/"
+      globalPath: "/mnt/ack_oss/oss-csi-pv"

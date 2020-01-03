@@ -8,7 +8,7 @@ spec:
   resources:
     requests:
       storage: 25Gi
-  storageClassName: csi-disk
+  storageClassName: alicloud-disk-ssd
 ---
 apiVersion: apps/v1
 kind: Deployment
